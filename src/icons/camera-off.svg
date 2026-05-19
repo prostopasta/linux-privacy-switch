@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Camera body (grey/dark) -->
+  <rect x="2" y="7" width="20" height="14" rx="2" ry="2" fill="#7f8c8d" />
+  <!-- Lens (dark) -->
+  <circle cx="12" cy="14" r="4" fill="#555" />
+  <circle cx="12" cy="14" r="2.5" fill="#666" />
+  <!-- Viewfinder bump -->
+  <rect x="8" y="4" width="5" height="4" rx="1" fill="#7f8c8d" />
+  <!-- Flash -->
+  <rect x="15" y="5" width="3" height="2" rx="0.5" fill="#666" />
+  <!-- Red X cross (disabled indicator) -->
+  <line x1="3" y1="3" x2="21" y2="21" stroke="#e74c3c" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="21" y1="3" x2="3" y2="21" stroke="#e74c3c" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

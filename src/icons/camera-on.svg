@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Camera body -->
+  <rect x="2" y="7" width="20" height="14" rx="2" ry="2" fill="#2ecc71" />
+  <!-- Lens -->
+  <circle cx="12" cy="14" r="4" fill="#1a9150" />
+  <circle cx="12" cy="14" r="2.5" fill="#27ae60" />
+  <circle cx="10.5" cy="12.5" r="0.7" fill="#a8f0c0" opacity="0.8" />
+  <!-- Viewfinder bump -->
+  <rect x="8" y="4" width="5" height="4" rx="1" fill="#2ecc71" />
+  <!-- Flash -->
+  <rect x="15" y="5" width="3" height="2" rx="0.5" fill="#27ae60" />
+  <!-- Microphone indicator dot -->
+  <circle cx="20" cy="8" r="2.5" fill="#27ae60" />
+  <circle cx="20" cy="8" r="1.5" fill="#1abc9c" />
+</svg>

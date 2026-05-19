@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Privacy Switch Tray
+Comment=Camera and microphone status indicator
+Exec=/usr/local/bin/privacy-tray
+Icon=camera-web
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

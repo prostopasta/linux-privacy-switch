@@ -1,0 +1,15 @@
+[Unit]
+Description=Hardware privacy switch daemon (camera + microphone)
+Documentation=https://github.com/prostopasta/linux-privacy-switch
+After=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/privacy-switch --config /etc/linux-privacy-switch/devices.conf
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
