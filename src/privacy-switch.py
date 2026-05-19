@@ -200,16 +200,10 @@ def heartbeat_write():
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 
-def camera_probe_state() -> bool | None:
+def _camera_measure_brightness() -> float | None:
     """
-    Captures one frame via V4L2 and determines slider state by the fraction of non-zero bytes.
-
-    When slider is OFF: sensor is blocked, MJPEG contains only a header (~1% non-zero).
-    When slider is ON: real frame, > 5% non-zero even in a dark room.
-
-    True  = camera enabled
-    False = camera disabled (black frame)
-    None  = could not determine (device busy or no camera found)
+    Capture one V4L2 MJPEG frame; return % nonzero bytes, or None on error/busy.
+    Timeout (no frame in 3 s) returns 0.0 — sensor not outputting = slider OFF.
     """
     import fcntl as _fcntl
     import mmap as _mmap
@@ -224,10 +218,9 @@ def camera_probe_state() -> bool | None:
     VIDIOC_STREAMOFF = 0x40045613
 
     V4L2_CAP_VIDEO_CAPTURE = 0x00000001
-    V4L2_BUF_TYPE    = 1
-    V4L2_MEMORY_MMAP = 1
+    V4L2_BUF_TYPE      = 1
+    V4L2_MEMORY_MMAP   = 1
     V4L2_PIX_FMT_MJPEG = 0x47504A4D
-    NONZERO_THRESHOLD  = 3.0  # % nonzero; OFF frame ~1.2%, ON frame 5-6%; 3% is the safe midpoint
 
     for dev in sorted(glob.glob("/dev/video*")):
         fd = -1
@@ -268,18 +261,14 @@ def camera_probe_state() -> bool | None:
 
             r, _, _ = select.select([fd], [], [], 3.0)
             if not r:
-                log.info("camera_probe: timeout — no frame → slider OFF")
-                return False
+                log.info("camera_probe: %s timeout — no frame", dev)
+                return 0.0
 
             _fcntl.ioctl(fd, VIDIOC_DQBUF, qb)
             mm.seek(0)
             data = mm.read(buf_len)
             zeros = data.count(b'\x00')
-            pct = (len(data) - zeros) / len(data) * 100
-            result = pct >= NONZERO_THRESHOLD
-            log.info("camera_probe: %s  %.1f%% nonzero → slider %s",
-                     dev, pct, "ON" if result else "OFF (black frame)")
-            return result
+            return (len(data) - zeros) / len(data) * 100
 
         except OSError as e:
             if e.errno == 16:  # EBUSY
@@ -306,6 +295,15 @@ def camera_probe_state() -> bool | None:
                     pass
 
     return None  # no V4L2 devices found
+
+
+def camera_probe_state(threshold: float = 3.0) -> bool | None:
+    pct = _camera_measure_brightness()
+    if pct is None:
+        return None
+    result = pct >= threshold
+    log.info("camera_probe: %.1f%% nonzero → slider %s", pct, "ON" if result else "OFF")
+    return result
 
 
 def camera_set(enabled: bool, camera_power_path: str):
@@ -387,14 +385,127 @@ def notify(enabled: bool, user_uid: int | None, user_name: str):
         log.warning("notify-send: %s", e)
 
 
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def _write_config_fields(config_path: str, section: str, fields: dict):
+    """Update key=value pairs in an INI section in-place, preserving all comments."""
+    try:
+        with open(config_path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    in_section = False
+    section_end = len(lines)
+    updated: set = set()
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == f"[{section}]":
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section_end = i
+                in_section = False
+                break
+            for key in list(fields):
+                if key not in updated:
+                    key_part = stripped.split("=", 1)[0].strip()
+                    if key_part == key:
+                        lines[i] = f"{key:<23} = {fields[key]}\n"
+                        updated.add(key)
+
+    for key, val in fields.items():
+        if key not in updated:
+            lines.insert(section_end, f"{key:<23} = {val}\n")
+            section_end += 1
+
+    with open(config_path, "w") as f:
+        f.writelines(lines)
+
+
+def calibrate_mode(config_path: str):
+    """Interactively measure V4L2 brightness in OFF and ON states, suggest threshold."""
+    profile = autodetect_device(config_path)
+    if not profile:
+        print("Device not recognized — cannot calibrate.")
+        sys.exit(1)
+
+    section = profile["_section"]
+    has_hw_kill = profile.get("has_hw_camera_kill", "false").lower() == "true"
+
+    print()
+    print("=" * 60)
+    print("Camera V4L2 threshold calibration")
+    print("=" * 60)
+    print(f"Profile: {section}")
+    print()
+
+    if not has_hw_kill:
+        print("WARNING: This device has has_hw_camera_kill = false.")
+        print("The camera sensor is always powered; brightness will not change")
+        print("when the slider moves.  Continuing anyway (for testing).")
+        print()
+
+    print("Step 1 — OFF state")
+    print("  Set the slider to OFF (camera disabled).")
+    if not has_hw_kill:
+        print("  Cover the camera lens with your finger during the measurement.")
+    input("  Press Enter when ready...")
+    pct_off = _camera_measure_brightness()
+    if pct_off is None:
+        print("ERROR: Could not read camera (busy or not found). Close other apps and retry.")
+        sys.exit(1)
+    print(f"  OFF brightness: {pct_off:.2f}% nonzero bytes")
+
+    print()
+    print("Step 2 — ON state")
+    print("  Set the slider to ON (camera active, lens uncovered).")
+    input("  Press Enter when ready...")
+    pct_on = _camera_measure_brightness()
+    if pct_on is None:
+        print("ERROR: Could not read camera (busy or not found).")
+        sys.exit(1)
+    print(f"  ON  brightness: {pct_on:.2f}% nonzero bytes")
+
+    gap = pct_on - pct_off
+    threshold = (pct_off + pct_on) / 2.0
+
+    print()
+    print(f"  Gap:                 {gap:.2f}%")
+    print(f"  Suggested threshold: {threshold:.1f}%")
+
+    if gap < 1.0:
+        print()
+        print("WARNING: Gap < 1% — hardware kill may not actually cut sensor power.")
+        print("  Try in a darker room, or verify the slider is fully in the OFF position.")
+    elif gap < 2.0:
+        print()
+        print("WARNING: Gap 1–2% — marginal reading.")
+        print("  Try a darker room or cover the lens more thoroughly for better accuracy.")
+
+    print()
+    ans = input(f"Save nonzero_threshold = {threshold:.1f} to config? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        _write_config_fields(config_path, section, {"nonzero_threshold": f"{threshold:.1f}"})
+        print(f"Saved nonzero_threshold = {threshold:.1f} to {config_path}")
+    else:
+        print("Not saved.")
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run(profile: dict, user_name: str):
-    input_dev         = find_input_event(profile["input_device_name"])
-    key_code          = int(profile["key_code"])
-    alsa_card         = profile.get("alsa_card", "0")
-    alsa_control      = profile.get("alsa_control", "Capture")
-    camera_power_path = profile.get("camera_power_path", "")
+    input_dev          = find_input_event(profile["input_device_name"])
+    key_code           = int(profile["key_code"])
+    alsa_card          = profile.get("alsa_card", "0")
+    alsa_control       = profile.get("alsa_control", "Capture")
+    camera_power_path  = profile.get("camera_power_path", "")
+    has_hw_camera_kill = profile.get("has_hw_camera_kill", "false").lower() == "true"
+    sync_camera        = profile.get("sync_camera", "true").lower() == "true"
+    sync_mic           = profile.get("sync_mic",    "true").lower() == "true"
+    threshold          = float(profile.get("nonzero_threshold", "3.0"))
 
     if not input_dev:
         log.error("Input device not found: %r. Run --detect.", profile["input_device_name"])
@@ -409,7 +520,8 @@ def run(profile: dict, user_name: str):
     last_toggle_time: float = 0.0
     DEBOUNCE_S = 0.3
 
-    log.info("device=%s  key=%d", input_dev, key_code)
+    log.info("device=%s  key=%d  hw_kill=%s  sync_camera=%s  sync_mic=%s  threshold=%.1f",
+             input_dev, key_code, has_hw_camera_kill, sync_camera, sync_mic, threshold)
 
     # At boot, wait until uptime >= 15s so the EC has time to apply the switch position to the sensor.
     # On service restart uptime is already large — skip the wait.
@@ -423,27 +535,33 @@ def run(profile: dict, user_name: str):
         log.info("Boot: waiting %.1fs for EC to stabilize...", wait)
         time.sleep(wait)
 
-    # Probe camera state via V4L2.
-    # If the camera is busy (another app), fall back to the saved state file.
-    log.info("V4L2 probe...")
-    probed = camera_probe_state()
-    if probed is not None:
-        cam_enabled = probed
-        state_save(cam_enabled)
-        log.info("Initial state (V4L2): %s", "on" if cam_enabled else "off")
+    # Probe camera state via V4L2 (only on hardware-kill devices).
+    # Software-only devices always have a powered sensor — probing is useless.
+    if has_hw_camera_kill:
+        log.info("V4L2 probe...")
+        probed = camera_probe_state(threshold)
+        if probed is not None:
+            cam_enabled = probed
+            state_save(cam_enabled)
+            log.info("Initial state (V4L2): %s", "on" if cam_enabled else "off")
+        else:
+            cam_enabled = state_load()
+            log.info("Initial state (file): %s", "on" if cam_enabled else "off")
     else:
+        log.info("Software-only mode — using saved state (no V4L2 probe)")
         cam_enabled = state_load()
-        log.info("Initial state (file): %s", "on" if cam_enabled else "off")
 
-    camera_set(cam_enabled, camera_power_path)
-    mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
+    if sync_camera:
+        camera_set(cam_enabled, camera_power_path)
+    if sync_mic:
+        mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
     notify(cam_enabled, user_uid, user_name)
     heartbeat_write()
 
     # Queue for results from the background V4L2 probe thread
     probe_q: queue.Queue = queue.Queue()
     probe_running = False
-    last_probe_t   = time.monotonic()
+    last_probe_t     = time.monotonic()
     last_heartbeat_t = time.monotonic()
     # Require 2 consecutive disagreements before correcting state — prevents
     # a single borderline V4L2 measurement from flipping state incorrectly.
@@ -474,12 +592,12 @@ def run(profile: dict, user_name: str):
                     last_heartbeat_t = now_t
                     heartbeat_write()
 
-                # Periodic V4L2 probe in a background thread
-                if not probe_running and now_t - last_probe_t >= PROBE_INTERVAL_S:
+                # Periodic V4L2 probe — only on hardware-kill devices
+                if has_hw_camera_kill and not probe_running and now_t - last_probe_t >= PROBE_INTERVAL_S:
                     last_probe_t = now_t
                     probe_running = True
                     threading.Thread(
-                        target=lambda q=probe_q: q.put(camera_probe_state()),
+                        target=lambda q=probe_q: q.put(camera_probe_state(threshold)),
                         daemon=True,
                     ).start()
 
@@ -500,8 +618,10 @@ def run(profile: dict, user_name: str):
                                 cam_enabled = probed
                                 probe_disagree_count = 0
                                 state_save(cam_enabled)
-                                camera_set(cam_enabled, camera_power_path)
-                                mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
+                                if sync_camera:
+                                    camera_set(cam_enabled, camera_power_path)
+                                if sync_mic:
+                                    mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
                                 notify(cam_enabled, user_uid, user_name)
                             else:
                                 log.info(
@@ -533,8 +653,10 @@ def run(profile: dict, user_name: str):
                     cam_enabled = not cam_enabled
                     probe_disagree_count = 0  # slider event is authoritative
                     log.info("Slider toggled → %s", "on" if cam_enabled else "off")
-                    camera_set(cam_enabled, camera_power_path)
-                    mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
+                    if sync_camera:
+                        camera_set(cam_enabled, camera_power_path)
+                    if sync_mic:
+                        mic_set(cam_enabled, alsa_card, alsa_control, user_uid, user_name)
                     state_save(cam_enabled)
                     notify(cam_enabled, user_uid, user_name)
         except OSError as e:
@@ -548,10 +670,12 @@ def run(profile: dict, user_name: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Hardware privacy switch daemon")
-    parser.add_argument("--detect",  action="store_true", help="Detect device profile")
-    parser.add_argument("--monitor", action="store_true", help="Monitor slider events")
-    parser.add_argument("--config",  default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--user",    default=None, help="User for notifications (default: active session)")
+    parser.add_argument("--detect",    action="store_true", help="Detect device profile")
+    parser.add_argument("--monitor",   action="store_true", help="Monitor slider events")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Interactively calibrate V4L2 detection threshold (hardware kill devices only)")
+    parser.add_argument("--config",    default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--user",      default=None, help="User for notifications (default: active session)")
     args = parser.parse_args()
 
     if args.detect:
@@ -559,6 +683,9 @@ def main():
         return
     if args.monitor:
         monitor_mode()
+        return
+    if args.calibrate:
+        calibrate_mode(args.config)
         return
 
     profile = autodetect_device(args.config)

@@ -67,7 +67,9 @@ Physical slider → ITE EC → /dev/input/eventN
 On every start the daemon:
 
 1. **Waits** until system uptime ≥ 15 s — gives the ITE EC time to apply the switch position to the camera sensor before probing.
-2. **Captures one V4L2 frame** from `/dev/video0`. A black frame (< 5 % non-zero bytes) means the slider is **OFF**; a live frame means **ON**. This is necessary because `camera_power` sysfs always reads `0` on affected hardware — the EC controls the sensor directly.
+2. **Determines initial state:**
+   - *Hardware kill devices* (`has_hw_camera_kill = true`): captures one V4L2 frame. A black frame (< `nonzero_threshold` % nonzero bytes, default 3%) means the slider is **OFF**; a live frame means **ON**. This is necessary because `camera_power` sysfs always reads `0` on affected hardware — the EC controls the sensor directly.
+   - *Software-only devices* (`has_hw_camera_kill = false`): the sensor is always powered, so probing is skipped. The daemon reads the last saved state file.
 3. **Drains** any buffered EC init-events so they aren't misread as user toggles.
 4. **Enters the event loop.** From here, every EC key event is a real slider movement.
 
@@ -77,7 +79,24 @@ Every **60 seconds** the daemon re-probes the camera in a background thread. If 
 
 ### Daemon liveness
 
-The daemon writes a Unix timestamp to `/var/lib/linux-privacy-switch/heartbeat` every 10 s. The tray reads it: if the file is older than 30 s the icon switches to **⚠ Daemon not responding** until the service recovers (`Restart=on-failure` in the unit file handles this automatically).
+The daemon writes a Unix timestamp to `/var/lib/linux-privacy-switch/heartbeat` every 10 s. The tray reads it: if the file is older than 30 s the icon switches to **⚠ Daemon not responding** until the service recovers (`Restart=always` in the unit file handles this automatically).
+
+---
+
+## Device modes
+
+The daemon operates in one of two modes depending on the device profile:
+
+| Mode | `has_hw_camera_kill` | V4L2 probe | State source at boot |
+|---|---|---|---|
+| Hardware kill | `true` | Yes — black frame = OFF | V4L2 reading (authoritative) |
+| Software-only | `false` | No | Saved state file |
+
+**Hardware kill** (e.g. Lenovo Legion slider): the ITE Embedded Controller physically disconnects the camera sensor from the bus. A V4L2 frame captured while the slider is OFF contains almost no signal (~1% nonzero bytes), making the probe reliable. The daemon runs it once at startup and repeats every 60 s.
+
+**Software-only** (e.g. Fn+key on IdeaPad 5): the sensor remains powered regardless of the key state. Probing would return a live frame even when "disabled", so the daemon skips V4L2 entirely and relies on the saved state file.
+
+Set `has_hw_camera_kill` appropriately in your device profile. The `install.sh` installer asks this as an interactive question.
 
 ---
 
@@ -133,6 +152,10 @@ input_device_name      = <device name from --detect>
 key_code               = <code from --monitor>
 alsa_card              = 0
 alsa_control           = Capture
+has_hw_camera_kill     = false   # see Device modes section
+sync_camera            = true
+sync_mic               = true
+description            = Short description
 ```
 
 Reinstall to apply:
@@ -141,7 +164,46 @@ Reinstall to apply:
 sudo bash install.sh
 ```
 
+### Scenario A — Physical slider (hardware kill, e.g. Legion 5)
+
+1. Run `--detect` to get DMI strings and input device name
+2. Run `--monitor` to identify the slider key code
+3. Add section to `devices.conf` with `has_hw_camera_kill = true`
+4. Reinstall: `sudo bash install.sh`
+5. Run `--calibrate` to find the optimal brightness threshold (see below)
+6. Test: move slider → camera cuts out, mic mutes, tray icon updates
+
+### Scenario B — Software-only Fn key (e.g. IdeaPad 5)
+
+1. Run `--detect` / `--monitor` as above
+2. Add section with `has_hw_camera_kill = false`
+3. Reinstall: `sudo bash install.sh`
+4. The daemon tracks state in software only — no V4L2 probe is performed
+5. Test: press key → mic mutes/unmutes, tray updates; camera indicator changes but the sensor stays live (this is expected)
+
+### Scenario C — No dedicated key
+
+Not yet supported. Would require integrating a hotkey daemon (e.g. xbindkeys). Contributions welcome.
+
 Pull requests with new device profiles are welcome.
+
+---
+
+## Calibration
+
+Only relevant for devices with `has_hw_camera_kill = true`.
+
+The daemon detects camera state by comparing V4L2 frame brightness against a threshold. The default is **3%** nonzero bytes — a safe midpoint between a typical OFF frame (~1.2%) and a typical ON frame (~5–6%).
+
+**When to calibrate:** when adding a new hardware-kill device, or if the indicator flips incorrectly.
+
+**Important:** If your model has no physical lens cover, cover the camera with your finger during the OFF-state measurement — some sensors output a faint residual signal even when the EC cuts power.
+
+```bash
+sudo python3 /usr/local/bin/privacy-switch --calibrate
+```
+
+The wizard measures brightness in both states, suggests the optimal threshold, and offers to save `nonzero_threshold` to your device profile. The installer also offers to run calibration on first install.
 
 ---
 
@@ -156,6 +218,19 @@ Pull requests with new device profiles are welcome.
 **Wrong state after reboot** — the daemon needs ~15–18 s to finish the startup probe. Wait a moment, then check `cat /var/lib/linux-privacy-switch/state`.
 
 **Mic not muting during a video call** — while another app is streaming the camera, the V4L2 probe returns `EBUSY` and is skipped; the daemon uses the last saved state. Toggle the slider once to force a sync.
+
+---
+
+## Future extensions
+
+The hardware privacy switch concept is not limited to camera and microphone. The same daemon architecture can be extended to cut any signal source on toggle:
+
+- **Wi-Fi** — `rfkill block wifi`
+- **Bluetooth** — `rfkill block bluetooth`
+- **USB ports** — cut power via `uhubctl` or hub-level sysfs
+- **Ethernet** — `ip link set eth0 down`
+
+Each source would get its own `sync_*` flag in the device profile, making the slider a universal hardware kill switch for all radio and I/O interfaces. Pull requests adding new sync targets are welcome.
 
 ---
 
