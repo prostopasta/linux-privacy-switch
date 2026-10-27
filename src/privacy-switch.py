@@ -369,6 +369,47 @@ def camera_set(enabled: bool, camera_power_path: str):
         log.warning("camera_set: %s", e)
 
 
+# ── Desktop session ───────────────────────────────────────────────────────────
+
+def session_env(user_uid: int, user_name: str = "") -> dict[str, str]:
+    """
+    Environment a command needs to reach the desktop user's session bus.
+
+    HOME comes from the password database: on a domain-joined machine the home
+    directory is not necessarily /home/<name>.
+    """
+    runtime_dir = f"/run/user/{user_uid}"
+    env = {
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+        "XDG_RUNTIME_DIR":          runtime_dir,
+    }
+    if user_name:
+        try:
+            env["HOME"] = pwd.getpwnam(user_name).pw_dir
+        except KeyError:
+            env["HOME"] = f"/home/{user_name}"
+    return env
+
+
+def user_command(user_name: str, user_uid: int, argv: list[str],
+                 extra_env: dict[str, str] | None = None) -> list[str]:
+    """
+    Command line that runs `argv` as the desktop user, with its session bus.
+
+    The variables have to be arguments of env(1), not the environment of the
+    sudo process: sudo resets the environment (env_reset), so whatever is
+    handed to subprocess.run(env=...) never reaches the command. That is how
+    notify-send ended up without DBUS_SESSION_BUS_ADDRESS, fell back to
+    starting its own bus through dbus-launch — which AppArmor denies — and no
+    notification was ever shown.
+    """
+    env = session_env(user_uid, user_name)
+    if extra_env:
+        env.update(extra_env)
+    return ["sudo", "-u", user_name, "env",
+            *(f"{k}={v}" for k, v in env.items()), *argv]
+
+
 # ── Microphone ────────────────────────────────────────────────────────────────
 
 def mic_set(enabled: bool, alsa_card: str, alsa_control: str, user_uid: int | None, user_name: str):
@@ -387,15 +428,11 @@ def mic_set(enabled: bool, alsa_card: str, alsa_control: str, user_uid: int | No
 
     if not user_uid:
         return
-    runtime_dir = f"/run/user/{user_uid}"
-    wpctl_mute  = "0" if enabled else "1"
+    wpctl_mute = "0" if enabled else "1"
     try:
         r = subprocess.run(
-            ["sudo", "-u", user_name,
-             "env",
-             f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
-             f"XDG_RUNTIME_DIR={runtime_dir}",
-             "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", wpctl_mute],
+            user_command(user_name, user_uid,
+                         ["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", wpctl_mute]),
             capture_output=True, text=True, timeout=3,
         )
         if r.returncode != 0:
@@ -414,20 +451,13 @@ def notify(enabled: bool, user_uid: int | None, user_name: str):
     icon    = "camera-web" if enabled else "camera-disabled"
     summary = "📷🎤 Camera and microphone ON" if enabled else "🚫🔇 Camera and microphone OFF"
     urgency = "normal" if enabled else "critical"
-    runtime_dir = f"/run/user/{user_uid}"
-    env = {
-        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
-        "XDG_RUNTIME_DIR":          runtime_dir,
-        "DISPLAY":                  ":1",
-        "XAUTHORITY":               f"{runtime_dir}/gdm/Xauthority",
-        "HOME":                     f"/home/{user_name}",
-        "PATH":                     "/usr/bin:/bin",
-    }
     try:
         r = subprocess.run(
-            ["sudo", "-u", user_name, "notify-send",
-             "-i", icon, "-u", urgency, "-t", "4000", "Privacy", summary],
-            env=env, timeout=5, capture_output=True, text=True,
+            user_command(user_name, user_uid,
+                         ["notify-send", "-i", icon, "-u", urgency,
+                          "-t", "4000", "Privacy", summary],
+                         {"PATH": "/usr/bin:/bin"}),
+            timeout=5, capture_output=True, text=True,
         )
         if r.returncode != 0:
             log.warning("notify-send: %s", r.stderr.strip())
