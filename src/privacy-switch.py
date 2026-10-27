@@ -200,6 +200,66 @@ def heartbeat_write():
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 
+# V4L2 ioctl request codes (linux/videodev2.h, 64-bit layout). The size of the
+# struct the kernel reads or writes is encoded in the code itself — see
+# _ioc_size(), which is what every buffer below is sized from.
+VIDIOC_QUERYCAP  = 0x80685600
+VIDIOC_S_FMT     = 0xC0D05605
+VIDIOC_REQBUFS   = 0xC0145608
+VIDIOC_QUERYBUF  = 0xC0585609
+VIDIOC_QBUF      = 0xC058560F
+VIDIOC_DQBUF     = 0xC0585611
+VIDIOC_STREAMON  = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+
+V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+V4L2_CAP_DEVICE_CAPS   = 0x80000000
+V4L2_BUF_TYPE      = 1
+V4L2_MEMORY_MMAP   = 1
+V4L2_PIX_FMT_MJPEG = 0x47504A4D
+
+# Field offsets inside the V4L2 structs (64-bit layout, linux/videodev2.h).
+CAP_CAPABILITIES = 84   # v4l2_capability.capabilities
+CAP_DEVICE_CAPS  = 88   # v4l2_capability.device_caps
+FMT_TYPE         = 0    # v4l2_format.type
+FMT_WIDTH        = 8    # v4l2_format.fmt.pix.width
+FMT_HEIGHT       = 12   # v4l2_format.fmt.pix.height
+FMT_PIXELFORMAT  = 16   # v4l2_format.fmt.pix.pixelformat
+REQ_COUNT        = 0    # v4l2_requestbuffers.count
+REQ_TYPE         = 4    # v4l2_requestbuffers.type
+REQ_MEMORY       = 8    # v4l2_requestbuffers.memory
+BUF_INDEX        = 0    # v4l2_buffer.index
+BUF_TYPE         = 4    # v4l2_buffer.type
+BUF_MEMORY       = 60   # v4l2_buffer.memory
+BUF_M_OFFSET     = 64   # v4l2_buffer.m.offset
+BUF_LENGTH       = 72   # v4l2_buffer.length
+
+
+def _ioc_size(request: int) -> int:
+    """Size of the struct an ioctl request passes to the kernel (_IOC_SIZE)."""
+    return (request >> 16) & 0x3FFF
+
+
+def _ioc_buffer(request: int) -> bytearray:
+    """
+    Mutable buffer of exactly the size the kernel expects for `request`.
+
+    It must not be smaller: for a reading ioctl the kernel fills the whole
+    struct, and since Python 3.14 fcntl.ioctl() puts a guard right after the
+    buffer and raises SystemError("buffer overflow") when the kernel writes
+    past its end. Deriving the size from the request code keeps buffer and
+    struct in sync by construction.
+    """
+    return bytearray(_ioc_size(request))
+
+
+def _buf_type_arg(request: int) -> bytearray:
+    """Argument for VIDIOC_STREAMON / VIDIOC_STREAMOFF — a single buffer type."""
+    arg = _ioc_buffer(request)
+    struct.pack_into('<I', arg, 0, V4L2_BUF_TYPE)
+    return arg
+
+
 def _camera_measure_brightness() -> float | None:
     """
     Capture one V4L2 MJPEG frame; return % nonzero bytes, or None on error/busy.
@@ -208,20 +268,6 @@ def _camera_measure_brightness() -> float | None:
     import fcntl as _fcntl
     import mmap as _mmap
 
-    VIDIOC_QUERYCAP  = 0x80685600
-    VIDIOC_S_FMT     = 0xC0D05605
-    VIDIOC_REQBUFS   = 0xC0145608
-    VIDIOC_QUERYBUF  = 0xC0585609
-    VIDIOC_QBUF      = 0xC058560F
-    VIDIOC_DQBUF     = 0xC0585611
-    VIDIOC_STREAMON  = 0x40045612
-    VIDIOC_STREAMOFF = 0x40045613
-
-    V4L2_CAP_VIDEO_CAPTURE = 0x00000001
-    V4L2_BUF_TYPE      = 1
-    V4L2_MEMORY_MMAP   = 1
-    V4L2_PIX_FMT_MJPEG = 0x47504A4D
-
     for dev in sorted(glob.glob("/dev/video*")):
         fd = -1
         mm = None
@@ -229,34 +275,40 @@ def _camera_measure_brightness() -> float | None:
         try:
             fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
 
-            cap_buf = bytearray(104)
+            cap_buf = _ioc_buffer(VIDIOC_QUERYCAP)
             _fcntl.ioctl(fd, VIDIOC_QUERYCAP, cap_buf)
-            if not (struct.unpack_from('<I', cap_buf, 64)[0] & V4L2_CAP_VIDEO_CAPTURE):
+            caps = struct.unpack_from('<I', cap_buf, CAP_CAPABILITIES)[0]
+            if caps & V4L2_CAP_DEVICE_CAPS:
+                # Multi-node device: the per-node caps live in device_caps.
+                caps = struct.unpack_from('<I', cap_buf, CAP_DEVICE_CAPS)[0]
+            if not (caps & V4L2_CAP_VIDEO_CAPTURE):
                 continue
 
-            fmt = bytearray(208)
-            struct.pack_into('<I', fmt, 0,  V4L2_BUF_TYPE)
-            struct.pack_into('<I', fmt, 8,  320)
-            struct.pack_into('<I', fmt, 12, 240)
-            struct.pack_into('<I', fmt, 16, V4L2_PIX_FMT_MJPEG)
+            fmt = _ioc_buffer(VIDIOC_S_FMT)
+            struct.pack_into('<I', fmt, FMT_TYPE,        V4L2_BUF_TYPE)
+            struct.pack_into('<I', fmt, FMT_WIDTH,       320)
+            struct.pack_into('<I', fmt, FMT_HEIGHT,      240)
+            struct.pack_into('<I', fmt, FMT_PIXELFORMAT, V4L2_PIX_FMT_MJPEG)
             _fcntl.ioctl(fd, VIDIOC_S_FMT, fmt)
 
-            rb = bytearray(16)
-            struct.pack_into('<III', rb, 0, 1, V4L2_BUF_TYPE, V4L2_MEMORY_MMAP)
+            rb = _ioc_buffer(VIDIOC_REQBUFS)
+            struct.pack_into('<I', rb, REQ_COUNT,  1)
+            struct.pack_into('<I', rb, REQ_TYPE,   V4L2_BUF_TYPE)
+            struct.pack_into('<I', rb, REQ_MEMORY, V4L2_MEMORY_MMAP)
             _fcntl.ioctl(fd, VIDIOC_REQBUFS, rb)
 
-            qb = bytearray(88)
-            struct.pack_into('<I', qb, 0,  0)
-            struct.pack_into('<I', qb, 4,  V4L2_BUF_TYPE)
-            struct.pack_into('<I', qb, 56, V4L2_MEMORY_MMAP)
+            qb = _ioc_buffer(VIDIOC_QUERYBUF)
+            struct.pack_into('<I', qb, BUF_INDEX,  0)
+            struct.pack_into('<I', qb, BUF_TYPE,   V4L2_BUF_TYPE)
+            struct.pack_into('<I', qb, BUF_MEMORY, V4L2_MEMORY_MMAP)
             _fcntl.ioctl(fd, VIDIOC_QUERYBUF, qb)
-            buf_len    = struct.unpack_from('<I', qb, 72)[0]
-            buf_offset = struct.unpack_from('<I', qb, 64)[0]
+            buf_len    = struct.unpack_from('<I', qb, BUF_LENGTH)[0]
+            buf_offset = struct.unpack_from('<I', qb, BUF_M_OFFSET)[0]
 
             mm = _mmap.mmap(fd, buf_len, _mmap.MAP_SHARED,
                             _mmap.PROT_READ | _mmap.PROT_WRITE, offset=buf_offset)
             _fcntl.ioctl(fd, VIDIOC_QBUF, qb)
-            _fcntl.ioctl(fd, VIDIOC_STREAMON, struct.pack('<I', V4L2_BUF_TYPE))
+            _fcntl.ioctl(fd, VIDIOC_STREAMON, _buf_type_arg(VIDIOC_STREAMON))
             streamon_ok = True
 
             r, _, _ = select.select([fd], [], [], 3.0)
@@ -280,7 +332,7 @@ def _camera_measure_brightness() -> float | None:
             try:
                 if streamon_ok and fd >= 0:
                     import fcntl as _f
-                    _f.ioctl(fd, VIDIOC_STREAMOFF, struct.pack('<I', V4L2_BUF_TYPE))
+                    _f.ioctl(fd, VIDIOC_STREAMOFF, _buf_type_arg(VIDIOC_STREAMOFF))
             except Exception:
                 pass
             try:
